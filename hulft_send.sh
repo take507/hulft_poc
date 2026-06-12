@@ -230,19 +230,40 @@ invoke_utlsend() {
 }
 
 # =============================================================================
+# utlsend 実行前の基準日時取得
+# =============================================================================
+# utllist のレコード日時と比較するための基準日時を取得する。
+# utlsend 呼び出し直前に実行すること。
+#
+# 出力形式: "YYYYMMDD HHMMSS"  例: "20260529 153000"
+# =============================================================================
+capture_send_time() {
+    date '+%Y%m%d %H%M%S'
+}
+
+# =============================================================================
 # utllist 結果解析
 # =============================================================================
 # 標準入力から utllist の出力を受け取り、最新レコードの
 # 完了コードと詳細コードを出力する。
+# レコードの開始日時が基準日時より新しいことも検証する。
+#
+# 引数:
+#   $1 - 基準日時文字列 "YYYYMMDD HHMMSS"（utlsend 前に取得した日時）
+#        省略または空文字の場合は日時チェックをスキップする
 #
 # 出力形式: "<完了コード> <詳細コード>"  例: "0000 0000"
 #           解析失敗時は空文字を返し、戻り値 1
 #
 # utllist 出力形式（ヘッダー行を除いたデータ行）:
 #   FILEID  HOSTNAME  DATE  START_TIME  END_TIME  RECORDS  STATUS  CONNECT
-#   STATUS フィールドが "完了コード-詳細コード" 形式
+#   DATE      フィールド（3列目）: YYYYMMDD 形式
+#   START_TIME フィールド（4列目）: HHMMSS 形式
+#   STATUS    フィールド（7列目）: "完了コード-詳細コード" 形式
 # =============================================================================
 parse_utllist_output() {
+    local send_time="${1:-}"  # 基準日時（省略可）
+
     local input
     input="$(cat)"  # 標準入力をすべて読む
 
@@ -257,7 +278,33 @@ parse_utllist_output() {
         return 1
     fi
 
-    # STATUS フィールド（7列目）を取得し "CCCC-DDDD" を分割
+    # --- 日時チェック ---------------------------------------------------
+    # send_time が指定されている場合のみ検証する
+    if [[ -n "$send_time" ]]; then
+        # DATE（3列目）と START_TIME（4列目）を結合して "YYYYMMDDHHMMSS" の数値文字列を作る
+        local record_datetime
+        record_datetime=$(echo "$last_line" | awk '{print $3 $4}')
+
+        # 基準日時も同じ形式（空白除去）に変換
+        local send_datetime
+        send_datetime="${send_time// /}"  # "YYYYMMDD HHMMSS" → "YYYYMMDDHHMMSS"
+
+        # 形式チェック（14桁の数字であること）
+        if ! [[ "$record_datetime" =~ ^[0-9]{14}$ ]]; then
+            log_warn "utllist レコードの日時フィールドの形式が不正です: '$record_datetime'"
+            return 1
+        fi
+
+        # 数値比較：レコード日時 > 基準日時 であること
+        if [[ "$record_datetime" -le "$send_datetime" ]]; then
+            log_warn "utllist のレコード日時 ($record_datetime) が送信前の基準日時 ($send_datetime) 以前です。古いレコードの可能性があります"
+            return 1
+        fi
+
+        log_info "日時チェック OK: レコード日時=${record_datetime}, 基準日時=${send_datetime}"
+    fi
+
+    # --- STATUS フィールド（7列目）を取得し "CCCC-DDDD" を分割 ----------
     local status_field
     status_field=$(echo "$last_line" | awk '{print $7}')
 
@@ -278,16 +325,19 @@ parse_utllist_output() {
 # =============================================================================
 # 引数:
 #   $1 - HULFTID
+#   $2 - 基準日時文字列 "YYYYMMDD HHMMSS"（utlsend 前に capture_send_time で取得）
+#        省略または空文字の場合は日時チェックをスキップする
 # 出力（名前参照引数でセット）:
-#   $2 - complete_code_ref  完了コード
-#   $3 - detail_code_ref    詳細コード
+#   $3 - complete_code_ref  完了コード
+#   $4 - detail_code_ref    詳細コード
 # 戻り値:
 #   0: 成功, $EXIT_ERR_UTLLIST: 失敗
 # =============================================================================
 get_delivery_status() {
     local hulft_id="$1"
-    local -n _complete_code=$2
-    local -n _detail_code=$3
+    local send_time="${2:-}"
+    local -n _complete_code=$3
+    local -n _detail_code=$4
 
     log_info "utllist 実行: utllist -s -f $hulft_id"
 
@@ -301,7 +351,7 @@ get_delivery_status() {
     fi
 
     local parsed
-    parsed=$(echo "$utllist_output" | parse_utllist_output)
+    parsed=$(echo "$utllist_output" | parse_utllist_output "$send_time")
     if [[ $? -ne 0 ]]; then
         log_error "utllist 出力の解析に失敗しました"
         return $EXIT_ERR_UTLLIST
@@ -381,6 +431,11 @@ run_send_with_retry() {
         attempt=$(( attempt + 1 ))
         log_info "送信試行 $attempt/$max_attempts 開始"
 
+        # utlsend 呼び出し前に基準日時を取得（utllist の日時チェックに使用）
+        local send_time
+        send_time=$(capture_send_time)
+        log_info "送信前基準日時: ${send_time}"
+
         # utlsend 呼び出し
         invoke_utlsend "$hulft_id" "$file_path" "$sync_flag" "$timeout"
         local send_rc=$?
@@ -404,7 +459,7 @@ run_send_with_retry() {
 
         # 同期モード: 完了コード/詳細コードを取得してリトライ判定
         local complete_code detail_code
-        get_delivery_status "$hulft_id" complete_code detail_code
+        get_delivery_status "$hulft_id" "$send_time" complete_code detail_code
         local status_rc=$?
 
         if [[ $status_rc -ne 0 ]]; then

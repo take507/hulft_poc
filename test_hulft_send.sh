@@ -89,6 +89,9 @@ reset_stubs() {
     STUB_UTLLIST_OUTPUT=""
     STUB_UTLLIST_RC=0
     STUB_SLEEP_CALL_COUNT=0
+    # capture_send_time スタブ: デフォルトは現在より十分過去の日時
+    # シナリオテストの utllist 出力日時（99991231 235959）は必ずこれより新しくなる
+    STUB_SEND_TIME="19700101 000000"
 }
 
 # hulft_send.sh を source（main は呼ばれない）
@@ -97,6 +100,11 @@ source "$TARGET_SCRIPT"
 # =============================================================================
 # スタブ関数定義（テスト時に外部コマンドを差し替え）
 # =============================================================================
+capture_send_time() {
+    # STUB_SEND_TIME が設定されている場合はそれを返す（テスト用固定値）
+    echo "${STUB_SEND_TIME:-$(date '+%Y%m%d %H%M%S')}"
+}
+
 run_utlsend() {
     STUB_UTLSEND_CALL_COUNT=$(( STUB_UTLSEND_CALL_COUNT + 1 ))
     return "${STUB_UTLSEND_RC:-0}"
@@ -241,40 +249,42 @@ test_apply_defaults_keeps_existing_timeout() {
 # =============================================================================
 # テスト: parse_utllist_output
 # =============================================================================
+
+# --- 既存テスト（日時チェックなし：send_time 省略） ---
+
 test_parse_utllist_normal() {
     local input
     input="FILEID    HOST NAME START DAY   START TIME END TIME   RECORDS  STATUS   CONNECT
-TEST1     SUN01.HO  2014/12/10  17:23:52   17:23:52          0 0250-0301   LAN
-TEST1     SUN01.HO  2014/12/11  17:52:17   17:52:18       1200 0000-0000   LAN"
+TEST1     SUN01.HO  20141210  172352   172352          0 0250-0301   LAN
+TEST1     SUN01.HO  20141211  175217   175218       1200 0000-0000   LAN"
 
     local result rc
     result=$(echo "$input" | parse_utllist_output)
     rc=$?
-    assert_rc "parse_utllist_output 正常終了" 0 $rc
+    assert_rc "parse_utllist_output 正常終了（日時チェックなし）" 0 $rc
     assert_eq "parse_utllist_output 結果" "0000 0000" "$result"
 }
 
 test_parse_utllist_picks_last_line() {
     local input
     input="FILEID    HOST NAME START DAY   START TIME END TIME   RECORDS  STATUS   CONNECT
-TEST1     SUN01.HO  2014/12/10  17:23:52   17:23:52          0 0250-0301   LAN
-TEST1     SUN01.HO  2014/12/11  17:52:17   17:52:18       1200 0000-0000   LAN"
+TEST1     SUN01.HO  20141210  172352   172352          0 0250-0301   LAN
+TEST1     SUN01.HO  20141211  175217   175218       1200 0000-0000   LAN"
 
     local result
     result=$(echo "$input" | parse_utllist_output)
-    # 最終行の STATUS を取得できているか
     assert_eq "最終行のSTATUSを取得" "0000 0000" "$result"
 }
 
 test_parse_utllist_retry_target_code() {
     local input
     input="FILEID    HOST NAME START DAY   START TIME END TIME   RECORDS  STATUS   CONNECT
-TEST1     SUN01.HO  2014/12/10  17:23:52   17:23:52          0 0250-0301   LAN"
+TEST1     SUN01.HO  20141210  172352   172352          0 0250-0301   LAN"
 
     local result rc
     result=$(echo "$input" | parse_utllist_output)
     rc=$?
-    assert_rc "リトライ対象コード解析" 0 $rc
+    assert_rc "リトライ対象コード解析（日時チェックなし）" 0 $rc
     assert_eq "リトライ対象コード値" "0250 0301" "$result"
 }
 
@@ -286,11 +296,60 @@ test_parse_utllist_empty_input() {
 }
 
 test_parse_utllist_invalid_status_format() {
-    local input="TEST1  HOST  2024/01/01  10:00:00  10:00:01  100 INVALID  LAN"
+    local input="TEST1  HOST  20240101  100000  100001  100 INVALID  LAN"
     local rc
     echo "$input" | parse_utllist_output 2>/dev/null
     rc=$?
     assert_rc "不正なSTATUS形式は失敗" 1 $rc
+}
+
+# --- 日時チェックのテスト（send_time 引数あり） ---
+
+test_parse_utllist_datetime_check_ok() {
+    # レコード日時（20260529 153001）> 基準日時（20260529 153000）→ OK
+    local input="TEST1  HOST  20260529  153001  153002  100 0000-0000  LAN"
+    local result rc
+    result=$(echo "$input" | parse_utllist_output "20260529 153000" 2>/dev/null)
+    rc=$?
+    assert_rc "日時チェック OK: 新しいレコード" 0 $rc
+    assert_eq "日時チェック OK: ステータス正常取得" "0000 0000" "$result"
+}
+
+test_parse_utllist_datetime_check_same_second_fails() {
+    # レコード日時 = 基準日時 → 同秒は古いレコードとみなしNG
+    local input="TEST1  HOST  20260529  153000  153001  100 0000-0000  LAN"
+    local rc
+    echo "$input" | parse_utllist_output "20260529 153000" 2>/dev/null
+    rc=$?
+    assert_rc "日時チェック NG: 同秒は失敗" 1 $rc
+}
+
+test_parse_utllist_datetime_check_old_record_fails() {
+    # レコード日時（20260529 152959）< 基準日時（20260529 153000）→ 古いレコードNG
+    local input="TEST1  HOST  20260529  152959  153000  100 0000-0000  LAN"
+    local rc
+    echo "$input" | parse_utllist_output "20260529 153000" 2>/dev/null
+    rc=$?
+    assert_rc "日時チェック NG: 古いレコードは失敗" 1 $rc
+}
+
+test_parse_utllist_datetime_check_invalid_format_fails() {
+    # DATE/START_TIME 列が不正な形式（14桁にならない）→ NG
+    local input="TEST1  HOST  BADDATE  BADTIME  153000  100 0000-0000  LAN"
+    local rc
+    echo "$input" | parse_utllist_output "20260529 153000" 2>/dev/null
+    rc=$?
+    assert_rc "日時チェック NG: 日時フィールド形式不正" 1 $rc
+}
+
+test_parse_utllist_datetime_check_empty_send_time_skips() {
+    # send_time が空文字 → 日時チェックをスキップして STATUS のみ検証
+    local input="TEST1  HOST  20140101  000000  000001  100 0000-0000  LAN"
+    local result rc
+    result=$(echo "$input" | parse_utllist_output "" 2>/dev/null)
+    rc=$?
+    assert_rc "日時チェックスキップ（send_time 空文字）" 0 $rc
+    assert_eq "日時チェックスキップ時もSTATUS取得" "0000 0000" "$result"
 }
 
 # =============================================================================
@@ -356,7 +415,7 @@ test_run_send_with_retry_success_first_try() {
     load_test_config
     reset_stubs
     STUB_UTLSEND_RC=0
-    STUB_UTLLIST_OUTPUT="FILEID  HOST  2024/01/01  10:00:00  10:00:01  100 0000-0000  LAN"
+    STUB_UTLLIST_OUTPUT="SEND001  HOST  99991231  235959  235959  100 0000-0000  LAN"
 
     run_send_with_retry "HID" "/tmp/f.dat" 1 300 2>/dev/null
     assert_rc "初回で成功" 0 $?
@@ -368,22 +427,35 @@ test_run_send_with_retry_retry_then_success() {
     load_test_config
     reset_stubs
 
-    # 1回目: リトライ対象コード、2回目: 正常コード
-    local call_count=0
+    # run_utllist はパイプ経由で呼ばれるためサブシェル内のカウントは親に伝わらない
+    # ファイルベースのカウンターで呼び出し回数を記録する
+    local _counter_file
+    _counter_file=$(mktemp)
+    echo 0 > "$_counter_file"
+
     run_utllist() {
-        call_count=$(( call_count + 1 ))
-        if [[ $call_count -eq 1 ]]; then
-            echo "FILEID  HOST  2024/01/01  10:00:00  10:00:01  100 0250-0301  LAN"
+        local _n
+        _n=$(cat "$_counter_file")
+        _n=$(( _n + 1 ))
+        echo "$_n" > "$_counter_file"
+        if [[ $_n -eq 1 ]]; then
+            echo "SEND001  HOST  99991231  235959  235959  100 0250-0301  LAN"
         else
-            echo "FILEID  HOST  2024/01/01  10:01:00  10:01:01  100 0000-0000  LAN"
+            echo "SEND001  HOST  99991231  235959  235959  100 0000-0000  LAN"
         fi
         return 0
     }
 
     run_send_with_retry "HID" "/tmp/f.dat" 1 300 2>/dev/null
-    assert_rc "リトライ後に成功" 0 $?
+    local rc=$?
+    local utllist_call_count
+    utllist_call_count=$(cat "$_counter_file")
+    rm -f "$_counter_file"
+
+    assert_rc "リトライ後に成功" 0 $rc
     assert_eq "utlsend 呼び出し回数 (1リトライ)" 2 $STUB_UTLSEND_CALL_COUNT
     assert_eq "sleep 呼び出し回数 (1回)" 1 $STUB_SLEEP_CALL_COUNT
+    assert_eq "utllist 呼び出し回数 (2回)" 2 "$utllist_call_count"
 
     # スタブを元に戻す
     run_utllist() {
@@ -396,7 +468,7 @@ test_run_send_with_retry_exhausted() {
     load_test_config
     reset_stubs
     # 常にリトライ対象コードを返す
-    STUB_UTLLIST_OUTPUT="FILEID  HOST  2024/01/01  10:00:00  10:00:01  100 0250-0301  LAN"
+    STUB_UTLLIST_OUTPUT="SEND001  HOST  99991231  235959  235959  100 0250-0301  LAN"
 
     run_send_with_retry "HID" "/tmp/f.dat" 1 300 2>/dev/null
     local rc=$?
@@ -410,9 +482,10 @@ test_run_send_with_retry_utlsend_failure() {
     reset_stubs
     STUB_UTLSEND_RC=8
 
+    # utlsend 失敗はリトライ対象: 上限(初回+RETRY_COUNT=3回)まで試行後に RETRY_OVER で終了
     run_send_with_retry "HID" "/tmp/f.dat" 1 300 2>/dev/null
-    assert_rc "utlsend 失敗は即終了" $EXIT_ERR_UTLSEND $?
-    assert_eq "utlsend は1回だけ呼ばれる" 1 $STUB_UTLSEND_CALL_COUNT
+    assert_rc "utlsend 失敗はリトライ上限超過で終了" $EXIT_ERR_RETRY_OVER $?
+    assert_eq "utlsend はリトライ上限回数分呼ばれる" 3 $STUB_UTLSEND_CALL_COUNT
 }
 
 test_run_send_with_retry_async_no_status_check() {
@@ -469,6 +542,13 @@ run_test test_parse_utllist_picks_last_line
 run_test test_parse_utllist_retry_target_code
 run_test test_parse_utllist_empty_input
 run_test test_parse_utllist_invalid_status_format
+
+echo "--- parse_utllist_output (日時チェック) ---"
+run_test test_parse_utllist_datetime_check_ok
+run_test test_parse_utllist_datetime_check_same_second_fails
+run_test test_parse_utllist_datetime_check_old_record_fails
+run_test test_parse_utllist_datetime_check_invalid_format_fails
+run_test test_parse_utllist_datetime_check_empty_send_time_skips
 
 echo "--- should_retry ---"
 run_test test_should_retry_complete_code_match
